@@ -3,22 +3,23 @@ import argparse
 import asyncio
 import ipaddress
 import logging
-import pathlib
+import platform
+import re
 import sys
-
-from icmplib import async_ping
 
 
 class PingScanner:
     logger: logging.Logger
+    logfile: str
     debug_mode: bool
     scanned: int
     alive: int
     dead: int
     errors: int
 
-    def __init__(self, debug: bool = False) -> None:
+    def __init__(self, debug: bool = False, logfile: str = None) -> None:
         self.debug_mode = debug
+        self.logfile = logfile
         self.logger = self.get_logger()
         self.scanned = 0
         self.alive = 0
@@ -40,22 +41,53 @@ class PingScanner:
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
-        file_handler = logging.FileHandler(pathlib.Path(__file__).with_suffix(".log"), encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        if self.logfile:
+            file_handler = logging.FileHandler(self.logfile, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
         return logger
 
     async def ping(self, ip: ipaddress.IPv4Address, timeout: int, semaphore: asyncio.Semaphore) -> None:
-        """Ping one address without launching an external process."""
+        """Ping one address using the system ping command."""
         async with semaphore:
             try:
-                result = await async_ping(str(ip), count=1, interval=0.2, timeout=timeout, privileged=False)
-                if result.is_alive:
-                    self.logger.info("%-16s OK %d ms", ip, result.avg_rtt)
+                if platform.system() == "Windows":
+                    command = ["ping", "-n", "1", "-w", str(timeout * 1000), str(ip)]
+                elif platform.system() == "Darwin":
+                    command = ["ping", "-n", "-c", "1", "-W", str(timeout * 1000), str(ip)]
+                else:
+                    command = ["ping", "-n", "-c", "1", "-W", str(timeout), str(ip)]
+
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout + 2)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+                    stdout = b""
+
+                output = stdout.decode(errors="replace")
+                match = re.search(r"time[=<]\s*([\d.,]+)\s*ms", output, re.IGNORECASE)
+
+                if process.returncode == 0 and match:
+                    rtt = match.group(1).replace(",", ".")
+                    self.logger.info("%-16s OK %s ms", ip, rtt)
                     self.alive += 1
                 else:
-                    self.logger.debug("%-16s No Response", ip)
+                    if process.returncode == 0:
+                        self.logger.debug("%-16s Fail (exit=%s, output=%r)", ip, process.returncode, output.strip())
+                    else:
+                        self.logger.debug("%-16s No Response", ip)
                     self.dead += 1
+
+            except FileNotFoundError:
+                self.logger.error("Ping command not found; install/provide the system ping utility.")
+                self.errors += 1
             except Exception as exc:
                 self.logger.error("%-16s Ping fail: %s", ip, exc)
                 self.errors += 1
@@ -87,10 +119,11 @@ if __name__ == "__main__":
     ap.add_argument("net", help="Network to scan", type=str, nargs="?", default="192.168.1.0/24")
     ap.add_argument("--timeout", "-t", help="Ping timeout in seconds", type=int, default=2)
     ap.add_argument("--threads", "-n", help="Maximum concurrent pings", type=int, default=100)
+    ap.add_argument("--logfile", "-l", help="File for logging", type=str)
     ap.add_argument("--debug", "-d", help="Show non-responsive addresses", action="store_true")
     args = ap.parse_args()
 
-    scanner = PingScanner(debug=args.debug)
+    scanner = PingScanner(debug=args.debug, logfile=args.logfile)
     try:
         asyncio.run(scanner.scan(net=args.net, timeout=args.timeout, threads=args.threads))
     except KeyboardInterrupt:
